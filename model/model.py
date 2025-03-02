@@ -24,26 +24,35 @@ class RMSNorm(torch.nn.Module):
 
 
 def precompute_pos_cis(dim: int, end: int, theta: float = 1e4):
+    """
+    为每个token的位置信息生成对应的幅角值
+    这里的dim指的是head_dim，也就是单个注意力头的维度
+    """
+    # dim//2的目的是保证即使dim是奇数，生成的旋转矩阵也是偶数
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    pos_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    t = torch.arange(end, device=freqs.device)  # type: ignore ,生成长度为seq_len的序列
+    freqs = torch.outer(t, freqs).float()  # type: ignore ,与幅角值做外积，生成shape为(seq_len, dim//2)的矩阵
+    pos_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64,计算幅角的cos与sin，以复数形式保存
     return pos_cis
 
 
 def apply_rotary_emb(xq, xk, pos_cis):
+    """应用旋转嵌入"""
     def unite_shape(pos_cis, x):
-        ndim = x.ndim
-        assert 0 <= 1 < ndim
+        ndim = x.ndim # x.shape:(bsz,seq_len,nums_head,head_dim/2)
+        assert 0 <= 1 < ndim # -> assert 1 < ndim
         assert pos_cis.shape == (x.shape[1], x.shape[-1])
-        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-        return pos_cis.view(*shape)
+        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)] # shape:(1,seq_len,1,head_dim/2)
+        return pos_cis.view(*shape) # shape:(1,seq_len,1,head_dim/2)
 
+    # xq,xk,shape:(bsz,seq_len,nums_head,head_dim)->shape(bsz,seq_len,nums_head,head_dim/2,2)
+    # 应用完view_as_complex之后xq_,xk_的shape:(bsz,seq_len,nums_head,head_dim/2)
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    pos_cis = unite_shape(pos_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * pos_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * pos_cis).flatten(3)
+    pos_cis = unite_shape(pos_cis, xq_) # 统一旋转角度矩阵跟qk矩阵的形状，方便相乘
+    #(bsz,seq_len,nums_head,head_dim/2)->(bsz,seq_len,nums_head,head_dim/2,2)->(bsz,seq_len,nums_head,head_dim)
+    xq_out = torch.view_as_real(xq_ * pos_cis).flatten(3) # 矩阵逐位相乘后转成实数域
+    xk_out = torch.view_as_real(xk_ * pos_cis).flatten(3) 
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -62,24 +71,26 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 class Attention(nn.Module):
     def __init__(self, args: LMConfig):
         super().__init__()
-        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads # 根据args.n_kv_heads是否是空来决定用MHA还是GQA
         assert args.n_heads % self.n_kv_heads == 0
         self.n_local_heads = args.n_heads
         self.n_local_kv_heads = self.n_kv_heads
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.dim // args.n_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads # 几个query共享kv，是float,//是int
+        self.head_dim = args.dim // args.n_heads # 单个注意力头的维度
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
         self.attn_dropout = nn.Dropout(args.dropout)
-        self.resid_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout) #resid：residual残差
         self.dropout = args.dropout
+        # pytorch中使用torch.nn.functional.scaled_dot_product_attention 函数提供了对 Flash Attention 的支持，
+        # 所以需要检测当前版本的pytorch是否有该函数以及我们的配置类LMConfig有没有启用flash_attn
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
         # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-        mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
-        mask = torch.triu(mask, diagonal=1)
-        self.register_buffer("mask", mask, persistent=False)
+        mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf")) # 创建一个shape为(1,1,max_seq_len,max_seq_len),值为-inf的mask
+        mask = torch.triu(mask, diagonal=1) # 将mask转为上三角矩阵,diagonal=1表示是否考虑对角线元素置为0，1表示考虑
+        self.register_buffer("mask", mask, persistent=False) # 注册成缓冲区不参与梯度计算，persistent=False表示缓冲区是否应该被保存为模型状态的一部分
 
     def forward(self,
                 x: torch.Tensor,
@@ -87,12 +98,12 @@ class Attention(nn.Module):
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False):
         bsz, seq_len, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x) # 执行x@wq,x@wk,x@wv操作，得到query,key,value矩阵
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, pos_cis)
+        xq, xk = apply_rotary_emb(xq, xk, pos_cis) # 为qk添加位置信息
         # kv_cache实现
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
@@ -260,6 +271,7 @@ class MOEFeedForward(nn.Module):
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: LMConfig):
         super().__init__()
+        # 273-275 是否可以考虑不用？
         self.n_heads = config.n_heads
         self.dim = config.dim
         self.head_dim = config.dim // config.n_heads
@@ -281,20 +293,24 @@ class MiniMindBlock(nn.Module):
         out = h + self.feed_forward(self.ffn_norm(h))
         return out, past_kv
 
-
+"""
+ 继承PreTrainedModel(PreTrainedModel也继承了nn.Module)主要负责管理模型的配置(因此在初始化的时候需要提供一个config),
+ 模型的参数加载，下载和保存(使用push_to_hub:将模型传到HF hub,以及from_pretrained:从HF hub下载模型等等)
+ """
 class MiniMindLM(PreTrainedModel):
-    config_class = LMConfig
+    config_class = LMConfig # 一个类属性，通常用于指定模型配置类，也就是告诉MiniMindLM类，谁是这个类的配置类
 
     def __init__(self, params: LMConfig = None):
-        self.params = params or LMConfig()
-        super().__init__(self.params)
+        self.params = params or LMConfig() # 如果实例没有提供params,则使用默认配置
+        super().__init__(self.params) # 调用父类初始化方法并传递参数
         self.vocab_size, self.n_layers = params.vocab_size, params.n_layers
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.dropout = nn.Dropout(params.dropout)
         self.layers = nn.ModuleList([MiniMindBlock(l, params) for l in range(self.n_layers)])
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
-        self.tok_embeddings.weight = self.output.weight
+        self.tok_embeddings.weight = self.output.weight # 嵌入层跟输出层的权重共享,实际上是共享相同的内存地址，而不是直接赋值
+        # 注册成缓冲区不参与梯度计算，persistent=False表示缓冲区是否应该被保存为模型状态的一部分
         self.register_buffer("pos_cis", precompute_pos_cis(params.dim // params.n_heads, params.max_seq_len,
                                                            theta=params.rope_theta), persistent=False)
         self.OUT = CausalLMOutputWithPast()

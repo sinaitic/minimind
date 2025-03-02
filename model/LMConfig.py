@@ -7,18 +7,18 @@ class LMConfig(PretrainedConfig):
 
     def __init__(
             self,
-            dim: int = 512,
-            n_layers: int = 8,
+            dim: int = 512, 
+            n_layers: int = 8, # MiniMind block的个数
             n_heads: int = 8,
             n_kv_heads: int = 2,
-            vocab_size: int = 6400,
+            vocab_size: int = 6400, # 词汇表大小
             hidden_dim: int = None,
             multiple_of: int = 64,
             norm_eps: float = 1e-5,
             max_seq_len: int = 8192,
             rope_theta: int = 1e6,
             dropout: float = 0.0,
-            flash_attn: bool = True,
+            flash_attn: bool = True, # 是否使用Flash-Attention
             ####################################################
             # Here are the specific configurations of MOE
             # When use_moe is false, the following is invalid
