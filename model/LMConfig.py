@@ -7,13 +7,13 @@ class LMConfig(PretrainedConfig):
 
     def __init__(
             self,
-            dim: int = 512, 
+            dim: int = 512, # 词向量维度
             n_layers: int = 8, # MiniMind block的个数
             n_heads: int = 8,
             n_kv_heads: int = 2,
             vocab_size: int = 6400, # 词汇表大小
-            hidden_dim: int = None,
-            multiple_of: int = 64,
+            hidden_dim: int = None, # 在前馈层升维后的隐藏层大小
+            multiple_of: int = 64, # 使SwiGLU后隐藏层大小为2的幂次方的倍数，优化计算效率的参数
             norm_eps: float = 1e-5,
             max_seq_len: int = 8192,
             rope_theta: int = 1e6,

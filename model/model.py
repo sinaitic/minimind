@@ -23,16 +23,12 @@ class RMSNorm(torch.nn.Module):
         return self.weight * (x.float() * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)).type_as(x)
 
 
-<<<<<<< HEAD
-def precompute_pos_cis(dim: int, end: int, theta: float = 1e4):
+def precompute_pos_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6):
     """
     为每个token的位置信息生成对应的幅角值
     这里的dim指的是head_dim，也就是单个注意力头的维度
     """
     # dim//2的目的是保证即使dim是奇数，生成的旋转矩阵也是偶数
-=======
-def precompute_pos_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6):
->>>>>>> 04b56ea86c48411c7c83914cd2a81a1f7a5ad522
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore ,生成长度为seq_len的序列
     freqs = torch.outer(t, freqs).float()  # type: ignore ,与幅角值做外积，生成shape为(seq_len, dim//2)的矩阵
@@ -61,15 +57,18 @@ def apply_rotary_emb(xq, xk, pos_cis):
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    """
+    torch.repeat_interleave(x, dim=2, repeats=n_rep)
+    整个函数等同于上面的语句
+    """
     bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
+    if n_rep == 1: # 说明使用的是mha，而非gqa
         return x
     return (
         x[:, :, :, None, :]
         .expand(bs, slen, n_kv_heads, n_rep, head_dim)
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
+    ) # (bsz,seq_len,n_kv_heads,head_dim)->(bsz,seq_len,n_kv_heads,n_rep,head_dim)->(bsz,seq_len,n_kv_heads*n_rep,head_dim),复制的数据的维度来源是head_dim
 
 
 class Attention(nn.Module):
@@ -108,18 +107,26 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
         xq, xk = apply_rotary_emb(xq, xk, pos_cis) # 为qk添加位置信息
-        # kv_cache实现
+        """
+            kv_cache实现，只在推理时启用，模型训练时不启用
+            past_key_value:(past_key,past_value)
+            past_key, past_value shape 都是(bsz,seq_len,n_kv_heads,head_dim)
+        """ 
         if past_key_value is not None:
-            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xk = torch.cat([past_key_value[0], xk], dim=1) # 按seq_len维度拼接，拼接之后长度是seq_len+1
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
 
         xq, xk, xv = (
-            xq.transpose(1, 2),
-            repeat_kv(xk, self.n_rep).transpose(1, 2),
-            repeat_kv(xv, self.n_rep).transpose(1, 2)
+            xq.transpose(1, 2), # (bsz,seq_len,n_local_heads,head_dim)->(bsz,n_local_heads,seq_len,head_dim)
+            repeat_kv(xk, self.n_rep).transpose(1, 2), # (bsz,seq_len,n_kv_heads,head_dim)->(bsz,n_kv_heads*n_rep,seq_len,head_dim)
+            repeat_kv(xv, self.n_rep).transpose(1, 2)  # (bsz,seq_len,n_kv_heads,head_dim)->(bsz,n_kv_heads*n_rep,seq_len,head_dim)
         )
+        # 这里的seq_len!=1是为了避免在训练时使用flash attention，因为flash attention要求输入序列长度大于1
         if self.flash and seq_len != 1:
+            # self.training来自nn.Module,
+            # 当你调用 model.train() 时，会将 self.training 设置为 True，表示模型处于训练模式。
+            # 当你调用 model.eval() 时，会将 self.training 设置为 False，表示模型处于评估模式
             dropout_p = self.dropout if self.training else 0.0
             output = F.scaled_dot_product_attention(
                 xq, xk, xv,
@@ -129,12 +136,13 @@ class Attention(nn.Module):
             )
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            scores += self.mask[:, :, :seq_len, :seq_len]
+            scores += self.mask[:, :, :seq_len, :seq_len] # 别忘记mask的shape的最后俩个维度是什么（是max_seq_len）
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = scores @ xv
 
-        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        # (bsz,n_local_heads,seq_len,head_dim)->(bsz,seq_len,n_local_heads,head_dim)->(bsz,seq_len,dim)
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1) 
         output = self.resid_dropout(self.wo(output))
         return output, past_kv
 
@@ -143,15 +151,18 @@ class FeedForward(nn.Module):
     def __init__(self, config: LMConfig):
         super().__init__()
         if config.hidden_dim is None:
-            hidden_dim = 4 * config.dim
-            hidden_dim = int(2 * hidden_dim / 3)
+            hidden_dim = 4 * config.dim # 一般升维的维度为4*dim
+            hidden_dim = int(2 * hidden_dim / 3) # 可直接为:8*config.dim//3，
+            # 乘以8/3之后可能不是2的倍数，使SwiGLU后隐藏层大小为2的倍数，优化计算效率的参数
             config.hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
+        # 不使用bias是因为bias会过度拟合训练数据，导致模型泛化能力变差
         self.w1 = nn.Linear(config.dim, config.hidden_dim, bias=False)
         self.w2 = nn.Linear(config.hidden_dim, config.dim, bias=False)
         self.w3 = nn.Linear(config.dim, config.hidden_dim, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
+        # 通过w1对隐藏层升维,通过w3对隐藏层升维后通过激活函数，两者逐位相乘后，再通过w2降维恢复原来的隐藏层大小
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 
@@ -159,47 +170,62 @@ class MoEGate(nn.Module):
     def __init__(self, config: LMConfig):
         super().__init__()
         self.config = config
-        self.top_k = config.num_experts_per_tok
-        self.n_routed_experts = config.n_routed_experts
+        self.top_k = config.num_experts_per_tok # 每个token选择的专家数量
+        self.n_routed_experts = config.n_routed_experts # 可用专家的总数
 
-        self.scoring_func = config.scoring_func
-        self.alpha = config.aux_loss_alpha
-        self.seq_aux = config.seq_aux
+        self.scoring_func = config.scoring_func # 评分函数 默认softmax
+        self.alpha = config.aux_loss_alpha # 辅助损失的alpha参数，默认0.1
+        self.seq_aux = config.seq_aux # 是否在序列级别上计算辅助损失
 
-        self.norm_topk_prob = config.norm_topk_prob
-        self.gating_dim = config.dim
-        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
+        self.norm_topk_prob = config.norm_topk_prob # 是否对选出的 top_k 专家的概率进行标准化。
+        self.gating_dim = config.dim # 门控机制的维度=模型的维度
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim))) # shape为(n_routed_experts,gating_dim)的未初始化矩阵，用来创建shape用
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         import torch.nn.init as init
+        # 采用kaiming_uniform_初始化权重，适用于relu激活函数及其变种,防止梯度消失或爆炸，a是x<0时的负斜率
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, hidden_states):
         bsz, seq_len, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)
-        logits = F.linear(hidden_states, self.weight, None)
+        hidden_states = hidden_states.view(-1, h) # shape(bsz*seq_len,h) seq_len大小代表token个数
+        logits = F.linear(hidden_states, self.weight, None) # 执行hidden_states@weight.T操作，得到logits,shape(bsz*seq_len,n_routed_experts)
         if self.scoring_func == 'softmax':
-            scores = logits.softmax(dim=-1)
+            # shape(bsz*seq_len,n_routed_experts)
+            scores = logits.softmax(dim=-1) # 每一行执行一组softmax（也就是按列维度softmax），这个分数表示每个专家参与计算每个token的得分
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
 
+        # topk_weight shape(bsz*seq_len,top_k)
+        # 小tips：sorted参数在windows上不管是true还是false，结果都是已排序的，在linux则不会
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
 
         if self.top_k > 1 and self.norm_topk_prob:
+            # denominator：分母
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
 
-        if self.training and self.alpha > 0.0:
-            scores_for_aux = scores
-            aux_topk = self.top_k
-            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+        if self.training and self.alpha > 0.0: # 训练模式下计算辅助损失以鼓励专家的多样性
+            scores_for_aux = scores # 用于计算辅助损失的分数,shape(bsz*seq_len,n_routed_experts)
+            aux_topk = self.top_k # 每个token选择的top_k个专家
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1) # 展开成(bsz,seq_len*top_k) 每一行代表单个seq_len 选出的专家数
+            # 是否在序列级别上计算辅助损失，否则在全局级别上计算辅助损失
+            # aux_loss：最终的辅助损失值
             if self.seq_aux:
-                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
-                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1) # shape为(bsz,seq_len,n_routed_experts)
+                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device) # shape为(bsz,n_routed_experts)
+                # 计算每个batch中每个专家被选中的次数，每一行是一个batch，所以dim=1
+                # 然后将每个专家被选中的次数*n_routed_experts/(seq_len*top_k)得到每个batch下每个专家被选中的概率
                 ce.scatter_add_(1, topk_idx_for_aux_loss,
                                 torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
                     seq_len * aux_topk / self.n_routed_experts)
+                """
+                scores_for_seq_aux shape 为(bsz,seq_len,n_routed_experts)
+                scores_for_seq_aux.mean(dim=1) shape为(bsz,n_routed_experts)表示每个batch下，各个专家各个token的平均权重
+                ce * scores_for_seq_aux.mean(dim=1) shape为(bsz,n_routed_experts)，专家被选中的概率*专家的平均权重，表示为专家在 batch 中的负载（频率×权重）的综合度量
+                .sum(dum=1) 是计算每个batch下所有专家的综合度量的和，.mean() 是计算所有batch下所有token的平均综合度量，最终*辅助损失的alpha参数
+                """
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
             else:
                 mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
@@ -208,7 +234,7 @@ class MoEGate(nn.Module):
                 fi = ce * self.n_routed_experts
                 aux_loss = (Pi * fi).sum() * self.alpha
         else:
-            aux_loss = 0
+            aux_loss = 0 # 推理模式下不使用负载均衡
         return topk_idx, topk_weight, aux_loss
 
 
@@ -216,6 +242,7 @@ class MOEFeedForward(nn.Module):
     def __init__(self, config: LMConfig):
         super().__init__()
         self.config = config
+        # 每个专家本质上就是个dense model的feedforward
         self.experts = nn.ModuleList([
             FeedForward(config)
             for _ in range(config.n_routed_experts)
@@ -313,24 +340,17 @@ class MiniMindLM(PreTrainedModel):
         self.layers = nn.ModuleList([MiniMindBlock(l, params) for l in range(self.n_layers)])
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
-<<<<<<< HEAD
         self.tok_embeddings.weight = self.output.weight # 嵌入层跟输出层的权重共享,实际上是共享相同的内存地址，而不是直接赋值
         # 注册成缓冲区不参与梯度计算，persistent=False表示缓冲区是否应该被保存为模型状态的一部分
         self.register_buffer("pos_cis", precompute_pos_cis(params.dim // params.n_heads, params.max_seq_len,
                                                            theta=params.rope_theta), persistent=False)
-=======
-        self.tok_embeddings.weight = self.output.weight
-        self.register_buffer("pos_cis",
-                             precompute_pos_cis(dim=params.dim // params.n_heads, theta=params.rope_theta),
-                             persistent=False)
->>>>>>> 04b56ea86c48411c7c83914cd2a81a1f7a5ad522
         self.OUT = CausalLMOutputWithPast()
 
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
-                **args):
+                **args): # 训练时不使用kvcache，所以默认为false
         past_key_values = past_key_values or [None] * len(self.layers)
         start_pos = args.get('start_pos', 0)
         h = self.dropout(self.tok_embeddings(input_ids))
