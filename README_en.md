@@ -239,7 +239,7 @@ git clone https://huggingface.co/jingyaogong/MiniMind2
 
 ```bash
 # load=0: load from pytorch model, load=1: load from transformers-hf model
-python eval_model.py --load 1
+python eval_model.py --load 1 --model_mode 2
 ```
 
 ### 4. Or Start WebUI
@@ -1305,7 +1305,6 @@ scores:
 | 7    | E     | 22                   | 23                       | 15                | 14                       | 74                 |
 | 8    | G     | 10                   | 12                       | 10                | 10                       | 42                 |
 
----
 
 ### 👉 Subjective Effect Summary
 
@@ -1317,6 +1316,8 @@ My personal evaluation aligns with DeepSeek-R1's results，and：
 * Model G may have incomplete training data, and the performance based on tested weights is poor.
 * Repeating the timeless Scaling Law: The larger the parameters and the more training data, the stronger the model's
   performance.
+
+---
 
 ## Ⅲ Objective Benchmark
 
@@ -1455,6 +1456,9 @@ is mainly for fun, so take the results lightly:
 
 <a href="https://github.com/RyanSunn"><b>@RyanSunn</b></a>:
 <a href="https://github.com/jingyaogong/minimind/issues/75">🔗Inference process learning record</a>
+
+<a href="https://github.com/Nijikadesu"><b>@Nijikadesu</b></a>:
+<a href="https://github.com/jingyaogong/minimind/issues/213">🔗Decompose project code in an interactive notebook format</a>
 
 <details close> 
 <summary> <b>Reference Links & Thanks to the following excellent papers or projects</b> </summary>

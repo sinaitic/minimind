@@ -225,7 +225,7 @@ git clone https://huggingface.co/jingyaogong/MiniMind2
 
 ```bash
 # load=0: load from pytorch model, load=1: load from transformers-hf model
-python eval_model.py --load 1
+python eval_model.py --load 1 --model_mode 2
 ```
 
 ### 4.或启动WebUI
@@ -1158,7 +1158,6 @@ DPO和在线PPO的区别在于reject和chosen都是离线准备的，和minimind
 | 7  | E  | 22        | 23        | 15        | 14         | 74        |
 | 8  | G  | 10        | 12        | 10        | 10         | 42        |
 
----
 
 ### 👉主观效果总结
 
@@ -1171,6 +1170,8 @@ DPO和在线PPO的区别在于reject和chosen都是离线准备的，和minimind
 * G模型可能训练数据不够完备，给出的权重经过测试效果不佳。
 
 * 再复诵一遍经久不衰的Scaling Law: 参数越大，训练数据越多模型的性能越强。
+
+---
 
 ## Ⅲ Objective Benchmark
 
@@ -1304,6 +1305,10 @@ MiniMind模型本身预训练数据集小的可怜，也没有针对性的对测
 
 <a href="https://github.com/RyanSunn"><b>@RyanSunn</b></a>:
 <a href="https://github.com/jingyaogong/minimind/issues/75">🔗推理过程学习记录</a>
+
+<a href="https://github.com/Nijikadesu"><b>@Nijikadesu</b></a>:
+<a href="https://github.com/jingyaogong/minimind/issues/213">🔗以交互笔记本方式分解项目代码</a>
+
 
 <details close> 
 <summary> <b>参考链接 & 感谢以下优秀的论文或项目</b> </summary>
